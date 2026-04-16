@@ -506,42 +506,23 @@ impl<Message> canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for Prog
         );
         frame.fill(&track, track_color);
 
-        // Draw the fill bar — rounded left, flat right
-        let fill_width = self.progress * w;
+        // Draw the fill as a capsule. Earlier attempts to draw a rounded-left,
+        // flat-right shape (composite arc path, circle + rectangle) rendered
+        // with a squared-off left edge on the iced canvas backend, so we
+        // settle for matching the track's capsule geometry end-to-end.
+        //
+        // For visibly non-zero progress, clamp the drawn width to at least
+        // one bar-height so the curvature is actually visible — a sliver
+        // narrower than the corner radius reads as a square pixel blob.
+        let fill_width = (self.progress * w).min(w);
         if fill_width > 0.5 {
-            let fill_path = canvas::Path::new(|b| {
-                let r = radius.min(fill_width / 2.0);
-
-                // Top edge: from top-left arc end to right
-                b.move_to(cosmic::iced::Point::new(r, 0.0));
-                b.line_to(cosmic::iced::Point::new(fill_width, 0.0));
-
-                // Right edge: flat
-                b.line_to(cosmic::iced::Point::new(fill_width, h));
-
-                // Bottom edge: from right to bottom-left arc start
-                b.line_to(cosmic::iced::Point::new(r, h));
-
-                // Bottom-left arc
-                b.arc_to(
-                    cosmic::iced::Point::new(0.0, h),
-                    cosmic::iced::Point::new(0.0, h - r),
-                    r,
-                );
-
-                // Left edge
-                b.line_to(cosmic::iced::Point::new(0.0, r));
-
-                // Top-left arc
-                b.arc_to(
-                    cosmic::iced::Point::new(0.0, 0.0),
-                    cosmic::iced::Point::new(r, 0.0),
-                    r,
-                );
-
-                b.close();
-            });
-            frame.fill(&fill_path, bar_color);
+            let visible_width = fill_width.max(h).min(w);
+            let fill = canvas::Path::rounded_rectangle(
+                cosmic::iced::Point::ORIGIN,
+                cosmic::iced::Size::new(visible_width, h),
+                radius.into(),
+            );
+            frame.fill(&fill, bar_color);
         }
 
         vec![frame.into_geometry()]
@@ -591,10 +572,14 @@ fn format_reset_time(iso: &str) -> Option<String> {
         return Some("Resetting...".into());
     }
 
-    let hours = diff.num_hours();
-    let minutes = diff.num_minutes() % 60;
+    let total_secs = diff.num_seconds();
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
 
-    if hours > 0 {
+    if days > 0 {
+        Some(format!("Resets in {days}d {hours}h"))
+    } else if hours > 0 {
         Some(format!("Resets in {hours}h {minutes}m"))
     } else {
         Some(format!("Resets in {minutes}m"))
