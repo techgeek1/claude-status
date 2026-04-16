@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Exec=/usr/bin/cosmic-ext-applet-claude-status
+Name=Claude Status
+Comment=Monitor Claude usage limits and service status
+Icon=dev.techgeek1.CosmicExtAppletClaudeStatus
+NoDisplay=true
+Categories=COSMIC;
+X-CosmicApplet=true
+X-CosmicAppletId=dev.techgeek1.CosmicExtAppletClaudeStatus
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=5

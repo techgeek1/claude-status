@@ -1,0 +1,145 @@
+use serde::Deserialize;
+use std::path::PathBuf;
+
+// --- OAuth credentials ---
+
+#[derive(Deserialize)]
+struct Credentials {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: Option<OAuthEntry>,
+}
+
+#[derive(Deserialize)]
+struct OAuthEntry {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+
+fn credentials_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("home directory exists")
+        .join(".claude/.credentials.json")
+}
+
+fn read_access_token() -> Result<String, String> {
+    let path = credentials_path();
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read credentials: {e}"))?;
+    let creds: Credentials =
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse credentials: {e}"))?;
+    creds
+        .claude_ai_oauth
+        .map(|o| o.access_token)
+        .ok_or_else(|| "No OAuth token found in credentials".into())
+}
+
+// --- Usage API ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageResponse {
+    pub five_hour: Option<UsageWindow>,
+    pub seven_day: Option<UsageWindow>,
+    pub seven_day_sonnet: Option<UsageWindow>,
+    pub extra_usage: Option<ExtraUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageWindow {
+    pub utilization: f64,
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtraUsage {
+    pub is_enabled: bool,
+    pub monthly_limit: Option<f64>,
+    pub used_credits: Option<f64>,
+    pub utilization: Option<f64>,
+    pub currency: Option<String>,
+}
+
+pub async fn fetch_usage() -> Result<UsageResponse, String> {
+    let token = read_access_token()?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(&token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Usage request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Usage API returned {}", resp.status()));
+    }
+
+    resp.json::<UsageResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse usage response: {e}"))
+}
+
+// --- Status API ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusSummary {
+    pub status: OverallStatus,
+    pub components: Vec<Component>,
+    pub incidents: Vec<Incident>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OverallStatus {
+    pub indicator: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Component {
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Incident {
+    pub name: String,
+    pub status: String,
+    pub impact: String,
+    pub incident_updates: Vec<IncidentUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IncidentUpdate {
+    pub body: String,
+    pub status: String,
+    pub updated_at: String,
+}
+
+pub async fn fetch_status() -> Result<StatusSummary, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://status.claude.com/api/v2/summary.json")
+        .send()
+        .await
+        .map_err(|e| format!("Status request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Status API returned {}", resp.status()));
+    }
+
+    resp.json::<StatusSummary>()
+        .await
+        .map_err(|e| format!("Failed to parse status response: {e}"))
+}
+
+/// Map a component/overall status string to a severity for icon coloring.
+/// Returns: 0 = operational, 1 = degraded/minor, 2 = partial/major outage, 3 = critical
+pub fn status_severity(indicator: &str) -> u8 {
+    match indicator {
+        "none" | "operational" => 0,
+        "minor" | "degraded_performance" => 1,
+        "major" | "partial_outage" => 2,
+        "critical" | "major_outage" => 3,
+        _ => 1,
+    }
+}
