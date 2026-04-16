@@ -103,6 +103,7 @@ pub struct Component {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Incident {
     pub name: String,
+    #[allow(dead_code)]
     pub status: String,
     pub impact: String,
     pub incident_updates: Vec<IncidentUpdate>,
@@ -111,7 +112,9 @@ pub struct Incident {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncidentUpdate {
     pub body: String,
+    #[allow(dead_code)]
     pub status: String,
+    #[allow(dead_code)]
     pub updated_at: String,
 }
 

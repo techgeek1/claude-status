@@ -22,7 +22,6 @@ const POPUP_REFRESH_SECS: u64 = 60;
 const DEBOUNCE: Duration = Duration::from_secs(5);
 const POPUP_WIDTH: f32 = 340.0;
 const BAR_GIRTH: f32 = 16.0;
-const BAR_RADIUS: f32 = 8.0;
 
 pub struct App {
     core: cosmic::app::Core,
@@ -293,7 +292,11 @@ impl cosmic::Application for App {
                             row![
                                 text::body("Spend"),
                                 widget::Space::new().width(Length::Fill),
-                                text::body(format!("{used:.2} / {limit:.2} {currency}")),
+                                text::body(format!(
+                                    "${:.2} / ${:.2} {currency}",
+                                    used / 100.0,
+                                    limit / 100.0,
+                                )),
                             ]
                             .align_y(Alignment::Center),
                         ));
