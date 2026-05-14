@@ -17,7 +17,6 @@ use cosmic::{
 
 use crate::api::{self, StatusSummary, UsageResponse};
 use crate::inhibit::{self, InhibitLock};
-use crate::rc::{self, RcSession};
 
 const APP_ID: &str = "dev.techgeek1.CosmicExtAppletClaudeStatus";
 const STATUS_POLL_SECS: u64 = 300;
@@ -25,7 +24,7 @@ const POPUP_REFRESH_SECS: u64 = 60;
 const DEBOUNCE: Duration = Duration::from_secs(5);
 const POPUP_WIDTH: f32 = 340.0;
 const BAR_GIRTH: f32 = 16.0;
-const RC_INDICATOR_COLOR: Color = Color::from_rgb(0.25, 0.55, 0.95);
+const INHIBIT_INDICATOR_COLOR: Color = Color::from_rgb(0.25, 0.55, 0.95);
 
 pub struct App {
     core: cosmic::app::Core,
@@ -39,7 +38,6 @@ pub struct App {
     fetching_status: bool,
     last_usage_fetch: Option<Instant>,
     last_status_fetch: Option<Instant>,
-    rc_sessions: Vec<RcSession>,
     inhibit: Option<Arc<InhibitLock>>,
     inhibit_pending: bool,
     inhibit_error: Option<String>,
@@ -53,8 +51,9 @@ pub enum Message {
     PopupRefreshTick,
     StatusResult(Result<StatusSummary, String>),
     UsageResult(Result<UsageResponse, String>),
-    RcTick,
+    ToggleInhibit,
     InhibitResult(Result<Arc<InhibitLock>, String>),
+    OrphanCleanupDone(Result<usize, String>),
 }
 
 impl App {
@@ -97,24 +96,17 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn handle_rc_tick(&mut self) -> app::Task<Message> {
-        self.rc_sessions = rc::scan_active();
-        let any_active = !self.rc_sessions.is_empty();
-
-        if !any_active {
-            if self.inhibit.is_some() {
-                self.inhibit = None;
-                tracing::info!("released sleep inhibitor: no RC sessions active");
-            }
+    fn handle_toggle_inhibit(&mut self) -> app::Task<Message> {
+        if self.inhibit_pending {
+            return Task::none();
+        }
+        if self.inhibit.take().is_some() {
+            tracing::info!("released sleep inhibitor");
             self.inhibit_error = None;
             return Task::none();
         }
-
-        if self.inhibit.is_some() || self.inhibit_pending {
-            return Task::none();
-        }
-
         self.inhibit_pending = true;
+        self.inhibit_error = None;
         cosmic::task::future(async {
             let result = inhibit::acquire().await.map(Arc::new);
             Message::InhibitResult(result)
@@ -157,15 +149,16 @@ impl cosmic::Application for App {
             fetching_status: false,
             last_usage_fetch: None,
             last_status_fetch: None,
-            rc_sessions: Vec::new(),
             inhibit: None,
             inhibit_pending: false,
             inhibit_error: None,
         };
 
         let status_task = app.fire_status_fetch();
-        let rc_task = app.handle_rc_tick();
-        (app, Task::batch(vec![status_task, rc_task]))
+        let cleanup_task = cosmic::task::future(async {
+            Message::OrphanCleanupDone(inhibit::cleanup_orphans().await)
+        });
+        (app, Task::batch(vec![status_task, cleanup_task]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -234,21 +227,16 @@ impl cosmic::Application for App {
                     }
                 }
             }
-            Message::RcTick => {
-                return self.handle_rc_tick();
+            Message::ToggleInhibit => {
+                return self.handle_toggle_inhibit();
             }
             Message::InhibitResult(result) => {
                 self.inhibit_pending = false;
                 match result {
                     Ok(lock) => {
                         self.inhibit_error = None;
-                        if self.rc_sessions.is_empty() {
-                            // RC ended before we got the lock — drop it immediately.
-                            drop(lock);
-                        } else {
-                            self.inhibit = Some(lock);
-                            tracing::info!("acquired sleep inhibitor for RC session");
-                        }
+                        self.inhibit = Some(lock);
+                        tracing::info!("acquired sleep inhibitor");
                     }
                     Err(e) => {
                         tracing::warn!("inhibit acquire failed: {e}");
@@ -256,6 +244,11 @@ impl cosmic::Application for App {
                     }
                 }
             }
+            Message::OrphanCleanupDone(result) => match result {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("terminated {n} orphaned inhibitor holder(s)"),
+                Err(e) => tracing::warn!("orphan inhibitor cleanup failed: {e}"),
+            },
         }
         Task::none()
     }
@@ -266,13 +259,13 @@ impl cosmic::Application for App {
         let dot_size: f32 = (icon_size * 0.3).max(6.0);
 
         let sev = self.status_severity();
-        let rc_active = !self.rc_sessions.is_empty();
+        let inhibit_active = self.inhibit.is_some();
 
         let icon_widget = icon::icon(self.icon_handle.clone())
             .width(Length::Fixed(icon_size))
             .height(Length::Fixed(icon_size));
 
-        let content: Element<'_, Message> = if sev > 0 || rc_active {
+        let content: Element<'_, Message> = if sev > 0 || inhibit_active {
             let mut stack = Stack::new()
                 .push(icon_widget)
                 .width(Length::Fixed(icon_size))
@@ -288,9 +281,9 @@ impl cosmic::Application for App {
                 ));
             }
 
-            if rc_active {
+            if inhibit_active {
                 stack = stack.push(overlay_dot(
-                    RC_INDICATOR_COLOR,
+                    INHIBIT_INDICATOR_COLOR,
                     dot_size,
                     icon_size,
                     Alignment::Start,
@@ -380,40 +373,49 @@ impl cosmic::Application for App {
             content = content.push(padded_control(text::body("Click to refresh")));
         }
 
-        // --- Remote Control section ---
-        if !self.rc_sessions.is_empty() || self.inhibit_error.is_some() {
-            content = content.push(
-                padded_control(widget::divider::horizontal::default())
-                    .padding([space_xxs, space_s]),
-            );
-            content = content.push(section_header("Remote Control"));
+        // --- Sleep inhibitor section ---
+        //
+        // Manual toggle. Replaces the previous auto-detect-and-inhibit-while-
+        // remote-control-attached behavior — Claude Code 2.1.140 no longer
+        // exposes a reliable on-disk RC state signal, so we let the user
+        // flip it themselves until upstream provides one. Tracking:
+        // https://github.com/anthropics/claude-code/issues/31840
+        content = content.push(
+            padded_control(widget::divider::horizontal::default())
+                .padding([space_xxs, space_s]),
+        );
+        content = content.push(section_header("Sleep Inhibitor"));
 
-            for session in &self.rc_sessions {
-                content = content.push(padded_control(
-                    row![
-                        rc_dot(),
-                        text::body(session.label()),
-                    ]
-                    .spacing(space_xs)
-                    .align_y(Alignment::Center),
-                ));
-            }
+        let button_label = if self.inhibit_pending {
+            "Working..."
+        } else if self.inhibit.is_some() {
+            "Allow sleep"
+        } else {
+            "Inhibit sleep"
+        };
 
-            let inhibit_note = if self.inhibit_error.is_some() {
-                "Sleep inhibitor unavailable".to_string()
-            } else if self.inhibit.is_some() {
-                "Idle sleep inhibited while active".to_string()
-            } else if self.inhibit_pending {
-                "Acquiring sleep inhibitor...".to_string()
-            } else {
-                String::new()
-            };
-            if !inhibit_note.is_empty() {
-                content = content.push(padded_control(text::caption(inhibit_note)));
-            }
-            if let Some(err) = &self.inhibit_error {
-                content = content.push(padded_control(text::caption(truncate(err, 80))));
-            }
+        let mut button = widget::button::standard(button_label);
+        if !self.inhibit_pending {
+            button = button.on_press(Message::ToggleInhibit);
+        }
+
+        content = content.push(padded_control(
+            row![
+                inhibit_dot(self.inhibit.is_some()),
+                text::body(if self.inhibit.is_some() {
+                    "Idle sleep inhibited"
+                } else {
+                    "Idle sleep allowed"
+                }),
+                widget::Space::new().width(Length::Fill),
+                button,
+            ]
+            .spacing(space_xs)
+            .align_y(Alignment::Center),
+        ));
+
+        if let Some(err) = &self.inhibit_error {
+            content = content.push(padded_control(text::caption(truncate(err, 80))));
         }
 
         // --- Divider ---
@@ -498,7 +500,6 @@ impl cosmic::Application for App {
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             iced::time::every(Duration::from_secs(STATUS_POLL_SECS)).map(|_| Message::StatusTick),
-            Subscription::run(rc_watch_stream),
         ];
 
         if self.popup.is_some() {
@@ -510,11 +511,6 @@ impl cosmic::Application for App {
 
         Subscription::batch(subs)
     }
-}
-
-fn rc_watch_stream() -> impl iced::futures::Stream<Item = Message> + Send {
-    use iced::futures::StreamExt;
-    rc::watch_events().map(|_| Message::RcTick)
 }
 
 // --- UI helpers ---
@@ -682,11 +678,16 @@ fn status_dot(severity: u8) -> Element<'static, Message> {
         .into()
 }
 
-fn rc_dot() -> Element<'static, Message> {
+fn inhibit_dot(active: bool) -> Element<'static, Message> {
+    let color = if active {
+        INHIBIT_INDICATOR_COLOR
+    } else {
+        Color::from_rgba(0.5, 0.5, 0.5, 0.4)
+    };
     container(widget::Space::new().width(8).height(8))
-        .class(cosmic::theme::Container::custom(|_theme| {
+        .class(cosmic::theme::Container::custom(move |_theme| {
             cosmic::iced::widget::container::Style {
-                background: Some(RC_INDICATOR_COLOR.into()),
+                background: Some(color.into()),
                 border: Border::default().rounded(4),
                 ..Default::default()
             }
