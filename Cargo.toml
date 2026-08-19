@@ -15,7 +15,12 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
+tokio = { version = "1", features = ["time", "rt"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+rustix = { version = "1", features = ["process"] }
+inotify = { version = "0.11", default-features = false, features = ["stream"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+async-stream = "0.3"
 
 libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
     "applet",

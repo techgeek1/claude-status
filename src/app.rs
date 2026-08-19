@@ -16,7 +16,9 @@ use cosmic::{
 };
 
 use crate::api::{self, StatusSummary, UsageResponse};
+use crate::config::Settings;
 use crate::inhibit::{self, InhibitLock};
+use crate::rc::{self, RcSession};
 
 const APP_ID: &str = "dev.techgeek1.CosmicExtAppletClaudeStatus";
 const STATUS_POLL_SECS: u64 = 300;
@@ -24,7 +26,7 @@ const POPUP_REFRESH_SECS: u64 = 60;
 const DEBOUNCE: Duration = Duration::from_secs(5);
 const POPUP_WIDTH: f32 = 340.0;
 const BAR_GIRTH: f32 = 16.0;
-const INHIBIT_INDICATOR_COLOR: Color = Color::from_rgb(0.25, 0.55, 0.95);
+const RC_INDICATOR_COLOR: Color = Color::from_rgb(0.25, 0.55, 0.95);
 
 pub struct App {
     core: cosmic::app::Core,
@@ -38,6 +40,8 @@ pub struct App {
     fetching_status: bool,
     last_usage_fetch: Option<Instant>,
     last_status_fetch: Option<Instant>,
+    settings: Settings,
+    rc_sessions: Vec<RcSession>,
     inhibit: Option<Arc<InhibitLock>>,
     inhibit_pending: bool,
     inhibit_error: Option<String>,
@@ -51,7 +55,8 @@ pub enum Message {
     PopupRefreshTick,
     StatusResult(Result<StatusSummary, String>),
     UsageResult(Result<UsageResponse, String>),
-    ToggleInhibit,
+    RcTick,
+    SetAutoInhibit(bool),
     InhibitResult(Result<Arc<InhibitLock>, String>),
     OrphanCleanupDone(Result<usize, String>),
 }
@@ -96,15 +101,29 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn handle_toggle_inhibit(&mut self) -> app::Task<Message> {
-        if self.inhibit_pending {
-            return Task::none();
-        }
-        if self.inhibit.take().is_some() {
-            tracing::info!("released sleep inhibitor");
+    fn handle_rc_tick(&mut self) -> app::Task<Message> {
+        self.rc_sessions = rc::scan_active();
+        self.sync_inhibit()
+    }
+
+    /// Bring the inhibitor in line with the current session set and the
+    /// user's preference. Idempotent, so every path that can change either
+    /// input just calls this instead of reasoning about the transition.
+    fn sync_inhibit(&mut self) -> app::Task<Message> {
+        let wanted = self.settings.auto_inhibit_remote() && !self.rc_sessions.is_empty();
+
+        if !wanted {
+            if self.inhibit.take().is_some() {
+                tracing::info!("released sleep inhibitor");
+            }
             self.inhibit_error = None;
             return Task::none();
         }
+
+        if self.inhibit.is_some() || self.inhibit_pending {
+            return Task::none();
+        }
+
         self.inhibit_pending = true;
         self.inhibit_error = None;
         cosmic::task::future(async {
@@ -149,16 +168,19 @@ impl cosmic::Application for App {
             fetching_status: false,
             last_usage_fetch: None,
             last_status_fetch: None,
+            settings: Settings::load(APP_ID),
+            rc_sessions: Vec::new(),
             inhibit: None,
             inhibit_pending: false,
             inhibit_error: None,
         };
 
         let status_task = app.fire_status_fetch();
+        let rc_task = app.handle_rc_tick();
         let cleanup_task = cosmic::task::future(async {
             Message::OrphanCleanupDone(inhibit::cleanup_orphans().await)
         });
-        (app, Task::batch(vec![status_task, cleanup_task]))
+        (app, Task::batch(vec![status_task, rc_task, cleanup_task]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -227,8 +249,12 @@ impl cosmic::Application for App {
                     }
                 }
             }
-            Message::ToggleInhibit => {
-                return self.handle_toggle_inhibit();
+            Message::RcTick => {
+                return self.handle_rc_tick();
+            }
+            Message::SetAutoInhibit(enabled) => {
+                self.settings.set_auto_inhibit_remote(enabled);
+                return self.sync_inhibit();
             }
             Message::InhibitResult(result) => {
                 self.inhibit_pending = false;
@@ -237,6 +263,9 @@ impl cosmic::Application for App {
                         self.inhibit_error = None;
                         self.inhibit = Some(lock);
                         tracing::info!("acquired sleep inhibitor");
+                        // The sessions may have detached (or the toggle been
+                        // flipped off) while the acquire was in flight.
+                        return self.sync_inhibit();
                     }
                     Err(e) => {
                         tracing::warn!("inhibit acquire failed: {e}");
@@ -259,13 +288,13 @@ impl cosmic::Application for App {
         let dot_size: f32 = (icon_size * 0.3).max(6.0);
 
         let sev = self.status_severity();
-        let inhibit_active = self.inhibit.is_some();
+        let rc_attached = !self.rc_sessions.is_empty();
 
         let icon_widget = icon::icon(self.icon_handle.clone())
             .width(Length::Fixed(icon_size))
             .height(Length::Fixed(icon_size));
 
-        let content: Element<'_, Message> = if sev > 0 || inhibit_active {
+        let content: Element<'_, Message> = if sev > 0 || rc_attached {
             let mut stack = Stack::new()
                 .push(icon_widget)
                 .width(Length::Fixed(icon_size))
@@ -281,9 +310,9 @@ impl cosmic::Application for App {
                 ));
             }
 
-            if inhibit_active {
+            if rc_attached {
                 stack = stack.push(overlay_dot(
-                    INHIBIT_INDICATOR_COLOR,
+                    RC_INDICATOR_COLOR,
                     dot_size,
                     icon_size,
                     Alignment::Start,
@@ -327,42 +356,105 @@ impl cosmic::Application for App {
         ));
 
         if let Some(usage) = &self.usage {
-            if let Some(w) = &usage.five_hour {
-                content = content.push(usage_bar("5-hour", w.utilization, &w.resets_at, space_xs));
-            }
-            if let Some(w) = &usage.seven_day {
-                content = content.push(usage_bar("7-day", w.utilization, &w.resets_at, space_xs));
-            }
-            if let Some(w) = &usage.seven_day_sonnet {
-                content = content.push(usage_bar("Sonnet", w.utilization, &w.resets_at, space_xs));
-            }
-            // Extra usage (pay-as-you-go overages)
-            if let Some(extra) = &usage.extra_usage {
-                if extra.is_enabled {
-                    content = content.push(
-                        padded_control(widget::divider::horizontal::default())
-                            .padding([space_xxs, space_s]),
-                    );
-                    content = content.push(section_header("Extra Usage"));
-
-                    let currency = extra.currency.as_deref().unwrap_or("USD");
-                    if let (Some(used), Some(limit)) = (extra.used_credits, extra.monthly_limit) {
-                        content = content.push(padded_control(
-                            row![
-                                text::body("Spend"),
-                                widget::Space::new().width(Length::Fill),
-                                text::body(format!(
-                                    "${:.2} / ${:.2} {currency}",
-                                    used / 100.0,
-                                    limit / 100.0,
-                                )),
-                            ]
-                            .align_y(Alignment::Center),
+            if usage.limits.is_empty() {
+                // Fallback for a response without the generic `limits` list.
+                let legacy = [
+                    ("5-hour", &usage.five_hour),
+                    ("7-day", &usage.seven_day),
+                    ("Opus", &usage.seven_day_opus),
+                    ("Sonnet", &usage.seven_day_sonnet),
+                ];
+                for (label, window) in legacy {
+                    if let Some(w) = window {
+                        content = content.push(usage_bar(
+                            label,
+                            w.utilization,
+                            w.resets_at.as_deref(),
+                            bar_color(w.utilization, None),
+                            space_xs,
                         ));
                     }
-                    if let Some(util) = extra.utilization {
-                        content = content.push(usage_bar("Budget", util, &None, space_xs));
-                    }
+                }
+            } else {
+                for limit in &usage.limits {
+                    content = content.push(usage_bar(
+                        limit_label(limit),
+                        limit.percent,
+                        limit.resets_at.as_deref(),
+                        bar_color(limit.percent, limit.severity.as_deref()),
+                        space_xs,
+                    ));
+                }
+            }
+
+            // Extra usage (pay-as-you-go overages). `spend` is the newer shape
+            // and carries its own currency exponent; `extra_usage` is the older
+            // cents-denominated one.
+            if let Some(spend) = usage.spend.as_ref().filter(|s| s.enabled) {
+                content = content.push(
+                    padded_control(widget::divider::horizontal::default())
+                        .padding([space_xxs, space_s]),
+                );
+                content = content.push(section_header("Extra Usage"));
+
+                if let Some(used) = &spend.used {
+                    let amount = match &spend.limit {
+                        Some(limit) => format!(
+                            "{:.2} / {:.2} {}",
+                            used.amount(),
+                            limit.amount(),
+                            used.currency()
+                        ),
+                        None => format!("{:.2} {}", used.amount(), used.currency()),
+                    };
+                    content = content.push(padded_control(
+                        row![
+                            text::body("Spend"),
+                            widget::Space::new().width(Length::Fill),
+                            text::body(amount),
+                        ]
+                        .align_y(Alignment::Center),
+                    ));
+                }
+                if let Some(percent) = spend.percent {
+                    content = content.push(usage_bar(
+                        "Budget",
+                        percent,
+                        None,
+                        bar_color(percent, None),
+                        space_xs,
+                    ));
+                }
+            } else if let Some(extra) = usage.extra_usage.as_ref().filter(|e| e.is_enabled) {
+                content = content.push(
+                    padded_control(widget::divider::horizontal::default())
+                        .padding([space_xxs, space_s]),
+                );
+                content = content.push(section_header("Extra Usage"));
+
+                let currency = extra.currency.as_deref().unwrap_or("USD");
+                if let (Some(used), Some(limit)) = (extra.used_credits, extra.monthly_limit) {
+                    content = content.push(padded_control(
+                        row![
+                            text::body("Spend"),
+                            widget::Space::new().width(Length::Fill),
+                            text::body(format!(
+                                "{:.2} / {:.2} {currency}",
+                                used / 100.0,
+                                limit / 100.0,
+                            )),
+                        ]
+                        .align_y(Alignment::Center),
+                    ));
+                }
+                if let Some(util) = extra.utilization {
+                    content = content.push(usage_bar(
+                        "Budget",
+                        util,
+                        None,
+                        bar_color(util, None),
+                        space_xs,
+                    ));
                 }
             }
         } else if let Some(err) = &self.usage_error {
@@ -373,46 +465,50 @@ impl cosmic::Application for App {
             content = content.push(padded_control(text::body("Click to refresh")));
         }
 
-        // --- Sleep inhibitor section ---
+        // --- Remote control / sleep inhibitor section ---
         //
-        // Manual toggle. Replaces the previous auto-detect-and-inhibit-while-
-        // remote-control-attached behavior — Claude Code 2.1.140 no longer
-        // exposes a reliable on-disk RC state signal, so we let the user
-        // flip it themselves until upstream provides one. Tracking:
-        // https://github.com/anthropics/claude-code/issues/31840
+        // Claude Code writes `bridgeSessionId` into ~/.claude/sessions/<pid>.json
+        // while a remote-control client is attached; we watch for that and hold
+        // a logind sleep:idle inhibitor for as long as any session is attached,
+        // so a remote session isn't cut off by idle suspend.
         content = content.push(
             padded_control(widget::divider::horizontal::default())
                 .padding([space_xxs, space_s]),
         );
-        content = content.push(section_header("Sleep Inhibitor"));
+        content = content.push(section_header("Remote Control"));
 
-        let button_label = if self.inhibit_pending {
-            "Working..."
-        } else if self.inhibit.is_some() {
-            "Allow sleep"
-        } else {
-            "Inhibit sleep"
-        };
-
-        let mut button = widget::button::standard(button_label);
-        if !self.inhibit_pending {
-            button = button.on_press(Message::ToggleInhibit);
-        }
-
+        let attached = self.rc_sessions.len();
         content = content.push(padded_control(
             row![
-                inhibit_dot(self.inhibit.is_some()),
-                text::body(if self.inhibit.is_some() {
-                    "Idle sleep inhibited"
-                } else {
-                    "Idle sleep allowed"
+                rc_dot(attached > 0),
+                text::body(match attached {
+                    0 => "No sessions attached".to_string(),
+                    1 => "1 session attached".to_string(),
+                    n => format!("{n} sessions attached"),
                 }),
-                widget::Space::new().width(Length::Fill),
-                button,
             ]
             .spacing(space_xs)
             .align_y(Alignment::Center),
         ));
+
+        for session in &self.rc_sessions {
+            content = content.push(padded_control(text::caption(session.label())));
+        }
+
+        content = content.push(padded_control(
+            row![
+                text::body("Inhibit sleep while attached"),
+                widget::Space::new().width(Length::Fill),
+                widget::toggler(self.settings.auto_inhibit_remote())
+                    .on_toggle(Message::SetAutoInhibit),
+            ]
+            .spacing(space_xs)
+            .align_y(Alignment::Center),
+        ));
+
+        if self.inhibit.is_some() {
+            content = content.push(padded_control(text::caption("Idle sleep inhibited")));
+        }
 
         if let Some(err) = &self.inhibit_error {
             content = content.push(padded_control(text::caption(truncate(err, 80))));
@@ -502,6 +598,8 @@ impl cosmic::Application for App {
             iced::time::every(Duration::from_secs(STATUS_POLL_SECS)).map(|_| Message::StatusTick),
         ];
 
+        subs.push(Subscription::run(rc_watch_stream));
+
         if self.popup.is_some() {
             subs.push(
                 iced::time::every(Duration::from_secs(POPUP_REFRESH_SECS))
@@ -513,41 +611,101 @@ impl cosmic::Application for App {
     }
 }
 
+fn rc_watch_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+    use iced::futures::StreamExt;
+    rc::watch_events().map(|_| Message::RcTick)
+}
+
 // --- UI helpers ---
 
 fn section_header(label: &str) -> Element<'_, Message> {
     padded_control(text::heading(label)).into()
 }
 
-fn usage_bar<'a>(
-    label: &'a str,
-    utilization: f64,
-    resets_at: &'a Option<String>,
-    spacing: u16,
-) -> Element<'a, Message> {
-    let reset_text = resets_at
-        .as_deref()
-        .and_then(format_reset_time)
-        .unwrap_or_default();
-
-    let bar_color = if utilization >= 90.0 {
-        BarColor::Danger
-    } else if utilization >= 70.0 {
-        BarColor::Warning
-    } else {
-        BarColor::Success
+/// Human-readable label for a limit entry. `kind` gives the window and the
+/// optional `scope` names what it applies to, e.g. `weekly_scoped` scoped to
+/// model "Fable" renders as "Weekly \u{b7} Fable".
+fn limit_label(limit: &api::Limit) -> String {
+    let base = match limit.kind.as_str() {
+        "session" => "Session".to_string(),
+        "weekly_all" | "weekly_scoped" => "Weekly".to_string(),
+        other => humanize(other),
     };
+
+    let qualifier = limit.scope.as_ref().and_then(|scope| {
+        let names: Vec<&str> = [scope.model.as_ref(), scope.surface.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|entity| entity.display_name.as_deref())
+            .collect();
+        (!names.is_empty()).then(|| names.join(" / "))
+    });
+
+    match qualifier {
+        Some(q) => format!("{base} \u{b7} {q}"),
+        None => base,
+    }
+}
+
+/// "weekly_all" -> "Weekly All". Only reached for limit kinds we don't know
+/// about yet, so it just has to be readable, not pretty.
+fn humanize(kind: &str) -> String {
+    let mut out = String::with_capacity(kind.len());
+    for (i, word) in kind.split('_').filter(|w| !w.is_empty()).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// Bar color from our own thresholds, escalated (never de-escalated) by the
+/// server's severity hint, so an unfamiliar severity string is harmless.
+fn bar_color(utilization: f64, severity: Option<&str>) -> BarColor {
+    let by_threshold = if utilization >= 90.0 {
+        2
+    } else if utilization >= 70.0 {
+        1
+    } else {
+        0
+    };
+    let by_severity = match severity {
+        Some("critical" | "danger" | "exhausted" | "over_limit") => 2,
+        Some("warning" | "warn" | "elevated") => 1,
+        _ => 0,
+    };
+
+    match by_threshold.max(by_severity) {
+        0 => BarColor::Success,
+        1 => BarColor::Warning,
+        _ => BarColor::Danger,
+    }
+}
+
+fn usage_bar(
+    label: impl Into<String>,
+    utilization: f64,
+    resets_at: Option<&str>,
+    color: BarColor,
+    spacing: u16,
+) -> Element<'static, Message> {
+    let reset_text = resets_at.and_then(format_reset_time).unwrap_or_default();
 
     let bar = canvas::Canvas::new(ProgressBarCanvas {
         progress: (utilization / 100.0).clamp(0.0, 1.0) as f32,
-        color: bar_color,
+        color,
     })
     .width(Length::Fill)
     .height(Length::Fixed(BAR_GIRTH));
 
     let mut col = column![
         row![
-            text::body(label),
+            text::body(label.into()),
             widget::Space::new().width(Length::Fill),
             text::caption(format!("{:.0}%", utilization)),
         ]
@@ -678,9 +836,9 @@ fn status_dot(severity: u8) -> Element<'static, Message> {
         .into()
 }
 
-fn inhibit_dot(active: bool) -> Element<'static, Message> {
+fn rc_dot(active: bool) -> Element<'static, Message> {
     let color = if active {
-        INHIBIT_INDICATOR_COLOR
+        RC_INDICATOR_COLOR
     } else {
         Color::from_rgba(0.5, 0.5, 0.5, 0.4)
     };

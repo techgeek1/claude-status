@@ -37,9 +37,19 @@ fn read_access_token() -> Result<String, String> {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageResponse {
+    /// Generic, self-describing limit list. Preferred over the named windows
+    /// below: the server adds/removes limit kinds (Opus, Sonnet, Fable, ...)
+    /// without us needing a matching field, and each entry carries its own
+    /// label material in `kind` + `scope`.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub limits: Vec<Limit>,
+    // Legacy named windows, kept as a fallback for when `limits` is absent.
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
+    pub seven_day_opus: Option<UsageWindow>,
     pub seven_day_sonnet: Option<UsageWindow>,
+    /// Newer form of `extra_usage`, with an explicit currency exponent.
+    pub spend: Option<Spend>,
     pub extra_usage: Option<ExtraUsage>,
 }
 
@@ -50,12 +60,93 @@ pub struct UsageWindow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Limit {
+    /// e.g. "session", "weekly_all", "weekly_scoped".
+    pub kind: String,
+    /// Percent utilized, 0-100.
+    #[serde(default)]
+    pub percent: f64,
+    /// e.g. "normal", "warning", "critical". Only ever escalates our
+    /// threshold-derived bar color, never de-escalates it.
+    pub severity: Option<String>,
+    pub resets_at: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub scope: Option<LimitScope>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LimitScope {
+    #[serde(default, deserialize_with = "lenient")]
+    pub model: Option<ScopeEntity>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub surface: Option<ScopeEntity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScopeEntity {
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Spend {
+    #[serde(default)]
+    pub enabled: bool,
+    pub used: Option<Money>,
+    pub limit: Option<Money>,
+    pub percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Money {
+    /// Amount in minor units (cents for USD), scaled by `exponent`.
+    pub amount_minor: f64,
+    pub currency: Option<String>,
+    pub exponent: Option<i32>,
+}
+
+impl Money {
+    pub fn amount(&self) -> f64 {
+        self.amount_minor / 10f64.powi(self.exponent.unwrap_or(2))
+    }
+
+    pub fn currency(&self) -> &str {
+        self.currency.as_deref().unwrap_or("USD")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExtraUsage {
     pub is_enabled: bool,
     pub monthly_limit: Option<f64>,
     pub used_credits: Option<f64>,
     pub utilization: Option<f64>,
     pub currency: Option<String>,
+}
+
+/// Deserialize a value, degrading a shape mismatch to `None` instead of
+/// failing the whole response. The usage endpoint is undocumented and its
+/// nested shapes change without notice; a new `scope` variant should cost us
+/// one label, not every bar.
+fn lenient<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// Same idea for a list: entries we can't parse are dropped individually.
+fn lenient_vec<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let values = Vec::<serde_json::Value>::deserialize(de)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
 }
 
 pub async fn fetch_usage() -> Result<UsageResponse, String> {
@@ -146,3 +237,4 @@ pub fn status_severity(indicator: &str) -> u8 {
         _ => 1,
     }
 }
+
