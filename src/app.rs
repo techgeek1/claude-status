@@ -823,10 +823,11 @@ fn format_reset_time(iso: &str) -> Option<String> {
     }
 }
 
+/// Cut `s` to at most `max` chars. Counts chars, not bytes: slicing at a byte
+/// offset panics mid-codepoint, and incident text is full of em-dashes.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
+    match s.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
     }
 }
