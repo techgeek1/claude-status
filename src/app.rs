@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cosmic::{
     Element, Task,
@@ -16,14 +15,17 @@ use cosmic::{
 };
 
 use crate::api::{self, StatusSummary, UsageResponse};
-use crate::config::Settings;
-use crate::inhibit::{self, InhibitLock};
 use crate::rc::{self, RcSession};
+use crate::shared::{self, Feed, Refresh};
 
 const APP_ID: &str = "dev.techgeek1.CosmicExtAppletClaudeStatus";
 const STATUS_POLL_SECS: u64 = 300;
 const POPUP_REFRESH_SECS: u64 = 60;
-const DEBOUNCE: Duration = Duration::from_secs(5);
+/// Minimum age of the shared cache before an open or refresh tick refetches.
+const POPUP_TTL: Duration = Duration::from_secs(60);
+/// Slightly under the poll interval, so of the N per-output instances ticking
+/// at different phases, only the first each round actually fetches.
+const STATUS_POLL_TTL: Duration = Duration::from_secs(STATUS_POLL_SECS - 10);
 const POPUP_WIDTH: f32 = 340.0;
 const BAR_GIRTH: f32 = 16.0;
 const RC_INDICATOR_COLOR: Color = Color::from_rgb(0.25, 0.55, 0.95);
@@ -34,17 +36,11 @@ pub struct App {
     icon_handle: cosmic::widget::icon::Handle,
     usage: Option<UsageResponse>,
     status: Option<StatusSummary>,
-    usage_error: Option<String>,
-    status_error: Option<String>,
+    usage_meta: shared::Entry,
+    status_meta: shared::Entry,
     fetching_usage: bool,
     fetching_status: bool,
-    last_usage_fetch: Option<Instant>,
-    last_status_fetch: Option<Instant>,
-    settings: Settings,
     rc_sessions: Vec<RcSession>,
-    inhibit: Option<Arc<InhibitLock>>,
-    inhibit_pending: bool,
-    inhibit_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,45 +49,51 @@ pub enum Message {
     PopupClosed(window::Id),
     StatusTick,
     PopupRefreshTick,
-    StatusResult(Result<StatusSummary, String>),
-    UsageResult(Result<UsageResponse, String>),
+    Refreshed(Feed, Result<Refresh, String>),
+    /// Some instance (possibly this one) rewrote the shared cache.
+    CacheChanged,
     RcTick,
-    SetAutoInhibit(bool),
-    InhibitResult(Result<Arc<InhibitLock>, String>),
-    OrphanCleanupDone(Result<usize, String>),
 }
 
 impl App {
-    fn should_fetch_usage(&self) -> bool {
-        !self.fetching_usage
-            && self
-                .last_usage_fetch
-                .map_or(true, |t| t.elapsed() >= DEBOUNCE)
-    }
-
-    fn should_fetch_status(&self) -> bool {
-        !self.fetching_status
-            && self
-                .last_status_fetch
-                .map_or(true, |t| t.elapsed() >= DEBOUNCE)
-    }
-
-    fn fire_usage_fetch(&mut self) -> app::Task<Message> {
-        if !self.should_fetch_usage() {
+    fn fire_usage_fetch(&mut self, ttl: Duration) -> app::Task<Message> {
+        if self.fetching_usage {
             return Task::none();
         }
         self.fetching_usage = true;
-        self.last_usage_fetch = Some(Instant::now());
-        cosmic::task::future(async { Message::UsageResult(api::fetch_usage().await) })
+        cosmic::task::future(async move {
+            let result = shared::refresh(Feed::Usage, ttl, api::fetch_usage).await;
+            Message::Refreshed(Feed::Usage, result)
+        })
     }
 
-    fn fire_status_fetch(&mut self) -> app::Task<Message> {
-        if !self.should_fetch_status() {
+    fn fire_status_fetch(&mut self, ttl: Duration) -> app::Task<Message> {
+        if self.fetching_status {
             return Task::none();
         }
         self.fetching_status = true;
-        self.last_status_fetch = Some(Instant::now());
-        cosmic::task::future(async { Message::StatusResult(api::fetch_status().await) })
+        cosmic::task::future(async move {
+            let result = shared::refresh(Feed::Status, ttl, api::fetch_status).await;
+            Message::Refreshed(Feed::Status, result)
+        })
+    }
+
+    fn apply_entry(&mut self, feed: Feed, entry: shared::Entry) {
+        match feed {
+            Feed::Usage => {
+                self.usage = entry.parse();
+                self.usage_meta = entry;
+            }
+            Feed::Status => {
+                self.status = entry.parse();
+                self.status_meta = entry;
+            }
+        }
+    }
+
+    fn reload_cache(&mut self) {
+        self.apply_entry(Feed::Usage, shared::load(Feed::Usage));
+        self.apply_entry(Feed::Status, shared::load(Feed::Status));
     }
 
     fn status_severity(&self) -> u8 {
@@ -101,36 +103,6 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn handle_rc_tick(&mut self) -> app::Task<Message> {
-        self.rc_sessions = rc::scan_active();
-        self.sync_inhibit()
-    }
-
-    /// Bring the inhibitor in line with the current session set and the
-    /// user's preference. Idempotent, so every path that can change either
-    /// input just calls this instead of reasoning about the transition.
-    fn sync_inhibit(&mut self) -> app::Task<Message> {
-        let wanted = self.settings.auto_inhibit_remote() && !self.rc_sessions.is_empty();
-
-        if !wanted {
-            if self.inhibit.take().is_some() {
-                tracing::info!("released sleep inhibitor");
-            }
-            self.inhibit_error = None;
-            return Task::none();
-        }
-
-        if self.inhibit.is_some() || self.inhibit_pending {
-            return Task::none();
-        }
-
-        self.inhibit_pending = true;
-        self.inhibit_error = None;
-        cosmic::task::future(async {
-            let result = inhibit::acquire().await.map(Arc::new);
-            Message::InhibitResult(result)
-        })
-    }
 }
 
 impl cosmic::Application for App {
@@ -162,25 +134,17 @@ impl cosmic::Application for App {
             icon_handle,
             usage: None,
             status: None,
-            usage_error: None,
-            status_error: None,
+            usage_meta: shared::Entry::default(),
+            status_meta: shared::Entry::default(),
             fetching_usage: false,
             fetching_status: false,
-            last_usage_fetch: None,
-            last_status_fetch: None,
-            settings: Settings::load(APP_ID),
-            rc_sessions: Vec::new(),
-            inhibit: None,
-            inhibit_pending: false,
-            inhibit_error: None,
+            rc_sessions: rc::scan_active(),
         };
 
-        let status_task = app.fire_status_fetch();
-        let rc_task = app.handle_rc_tick();
-        let cleanup_task = cosmic::task::future(async {
-            Message::OrphanCleanupDone(inhibit::cleanup_orphans().await)
-        });
-        (app, Task::batch(vec![status_task, rc_task, cleanup_task]))
+        // Show whatever a sibling instance already fetched before asking.
+        app.reload_cache();
+        let status_task = app.fire_status_fetch(STATUS_POLL_TTL);
+        (app, status_task)
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -204,8 +168,8 @@ impl cosmic::Application for App {
                     None,
                 );
 
-                let usage_task = self.fire_usage_fetch();
-                let status_task = self.fire_status_fetch();
+                let usage_task = self.fire_usage_fetch(POPUP_TTL);
+                let status_task = self.fire_status_fetch(POPUP_TTL);
                 return Task::batch(vec![get_popup(popup_settings), usage_task, status_task]);
             }
             Message::PopupClosed(id) => {
@@ -214,70 +178,33 @@ impl cosmic::Application for App {
                 }
             }
             Message::StatusTick => {
-                return self.fire_status_fetch();
+                return self.fire_status_fetch(STATUS_POLL_TTL);
             }
             Message::PopupRefreshTick => {
                 if self.popup.is_some() {
-                    let usage = self.fire_usage_fetch();
-                    let status = self.fire_status_fetch();
+                    let usage = self.fire_usage_fetch(POPUP_TTL);
+                    let status = self.fire_status_fetch(POPUP_TTL);
                     return Task::batch(vec![usage, status]);
                 }
             }
-            Message::StatusResult(result) => {
-                self.fetching_status = false;
+            Message::Refreshed(feed, result) => {
+                match feed {
+                    Feed::Usage => self.fetching_usage = false,
+                    Feed::Status => self.fetching_status = false,
+                }
                 match result {
-                    Ok(status) => {
-                        self.status_error = None;
-                        self.status = Some(status);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Status fetch failed: {e}");
-                        self.status_error = Some(e);
-                    }
+                    Ok(Refresh::Done(entry)) => self.apply_entry(feed, entry),
+                    // The fetching instance's write reaches us as CacheChanged.
+                    Ok(Refresh::Busy) => {}
+                    Err(e) => tracing::warn!("{feed:?} cache refresh failed: {e}"),
                 }
             }
-            Message::UsageResult(result) => {
-                self.fetching_usage = false;
-                match result {
-                    Ok(usage) => {
-                        self.usage_error = None;
-                        self.usage = Some(usage);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Usage fetch failed: {e}");
-                        self.usage_error = Some(e);
-                    }
-                }
+            Message::CacheChanged => {
+                self.reload_cache();
             }
             Message::RcTick => {
-                return self.handle_rc_tick();
+                self.rc_sessions = rc::scan_active();
             }
-            Message::SetAutoInhibit(enabled) => {
-                self.settings.set_auto_inhibit_remote(enabled);
-                return self.sync_inhibit();
-            }
-            Message::InhibitResult(result) => {
-                self.inhibit_pending = false;
-                match result {
-                    Ok(lock) => {
-                        self.inhibit_error = None;
-                        self.inhibit = Some(lock);
-                        tracing::info!("acquired sleep inhibitor");
-                        // The sessions may have detached (or the toggle been
-                        // flipped off) while the acquire was in flight.
-                        return self.sync_inhibit();
-                    }
-                    Err(e) => {
-                        tracing::warn!("inhibit acquire failed: {e}");
-                        self.inhibit_error = Some(e);
-                    }
-                }
-            }
-            Message::OrphanCleanupDone(result) => match result {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("terminated {n} orphaned inhibitor holder(s)"),
-                Err(e) => tracing::warn!("orphan inhibitor cleanup failed: {e}"),
-            },
         }
         Task::none()
     }
@@ -457,20 +384,18 @@ impl cosmic::Application for App {
                     ));
                 }
             }
-        } else if let Some(err) = &self.usage_error {
-            content = content.push(padded_control(text::body(truncate(err, 60))));
-        } else if self.fetching_usage {
+        } else if self.usage_meta.error.is_none() {
             content = content.push(padded_control(text::body("Loading...")));
-        } else {
-            content = content.push(padded_control(text::body("Click to refresh")));
         }
 
-        // --- Remote control / sleep inhibitor section ---
+        if let Some(caption) = freshness_caption(&self.usage_meta) {
+            content = content.push(padded_control(text::caption(caption)));
+        }
+
+        // --- Remote control section ---
         //
         // Claude Code writes `bridgeSessionId` into ~/.claude/sessions/<pid>.json
-        // while a remote-control client is attached; we watch for that and hold
-        // a logind sleep:idle inhibitor for as long as any session is attached,
-        // so a remote session isn't cut off by idle suspend.
+        // while a remote-control client is attached.
         content = content.push(
             padded_control(widget::divider::horizontal::default())
                 .padding([space_xxs, space_s]),
@@ -493,25 +418,6 @@ impl cosmic::Application for App {
 
         for session in &self.rc_sessions {
             content = content.push(padded_control(text::caption(session.label())));
-        }
-
-        content = content.push(padded_control(
-            row![
-                text::body("Inhibit sleep while attached"),
-                widget::Space::new().width(Length::Fill),
-                widget::toggler(self.settings.auto_inhibit_remote())
-                    .on_toggle(Message::SetAutoInhibit),
-            ]
-            .spacing(space_xs)
-            .align_y(Alignment::Center),
-        ));
-
-        if self.inhibit.is_some() {
-            content = content.push(padded_control(text::caption("Idle sleep inhibited")));
-        }
-
-        if let Some(err) = &self.inhibit_error {
-            content = content.push(padded_control(text::caption(truncate(err, 80))));
         }
 
         // --- Divider ---
@@ -579,10 +485,14 @@ impl cosmic::Application for App {
                     }
                 }
             }
-        } else if let Some(err) = &self.status_error {
-            content = content.push(padded_control(text::body(truncate(err, 60))));
-        } else {
+        } else if self.status_meta.error.is_none() {
             content = content.push(padded_control(text::body("Loading...")));
+        }
+
+        if self.status.is_none()
+            && let Some(caption) = freshness_caption(&self.status_meta)
+        {
+            content = content.push(padded_control(text::caption(caption)));
         }
 
         content = content.padding([8, 0]);
@@ -599,6 +509,7 @@ impl cosmic::Application for App {
         ];
 
         subs.push(Subscription::run(rc_watch_stream));
+        subs.push(Subscription::run(cache_watch_stream));
 
         if self.popup.is_some() {
             subs.push(
@@ -616,7 +527,32 @@ fn rc_watch_stream() -> impl iced::futures::Stream<Item = Message> + Send {
     rc::watch_events().map(|_| Message::RcTick)
 }
 
+fn cache_watch_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+    use iced::futures::StreamExt;
+    shared::watch_events().map(|_| Message::CacheChanged)
+}
+
 // --- UI helpers ---
+
+/// "Updated 14:32", plus the last error and next retry while backing off.
+fn freshness_caption(meta: &shared::Entry) -> Option<String> {
+    let clock = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+    };
+    let updated = meta.ok_at.and_then(clock).map(|t| format!("Updated {t}"));
+    let failure = meta.error.as_deref().map(|err| {
+        let err = truncate(err, 60);
+        match meta.retry_at().and_then(clock) {
+            Some(t) => format!("{err} \u{b7} retrying after {t}"),
+            None => err,
+        }
+    });
+    match (updated, failure) {
+        (Some(u), Some(f)) => Some(format!("{u} \u{b7} {f}")),
+        (u, f) => u.or(f),
+    }
+}
 
 fn section_header(label: &str) -> Element<'_, Message> {
     padded_control(text::heading(label)).into()

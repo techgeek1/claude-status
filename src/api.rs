@@ -1,5 +1,7 @@
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // --- OAuth credentials ---
 
@@ -149,25 +151,66 @@ where
         .collect())
 }
 
-pub async fn fetch_usage() -> Result<UsageResponse, String> {
+/// A failed fetch, with the server's `Retry-After` hint when it sent one.
+#[derive(Debug)]
+pub struct FetchError {
+    pub message: String,
+    pub retry_after: Option<Duration>,
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retry_after: None,
+        }
+    }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(secs) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).to_std().ok()
+}
+
+/// Send `req` and return the body as raw JSON, after checking it parses as
+/// `T` so a malformed response can't replace a good cached one.
+async fn get_json<T: DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    what: &str,
+) -> Result<serde_json::Value, FetchError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("{what} request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError {
+            message: format!("{what} API returned {status}"),
+            retry_after: retry_after(resp.headers()),
+        });
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to read {what} response: {e}"))?;
+    T::deserialize(&body).map_err(|e| format!("Failed to parse {what} response: {e}"))?;
+    Ok(body)
+}
+
+pub async fn fetch_usage() -> Result<serde_json::Value, FetchError> {
     let token = read_access_token()?;
-    let client = reqwest::Client::new();
-    let resp = client
+    let req = reqwest::Client::new()
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(&token)
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Usage request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Usage API returned {}", resp.status()));
-    }
-
-    resp.json::<UsageResponse>()
-        .await
-        .map_err(|e| format!("Failed to parse usage response: {e}"))
+        .header("Content-Type", "application/json");
+    get_json::<UsageResponse>(req, "Usage").await
 }
 
 // --- Status API ---
@@ -209,21 +252,9 @@ pub struct IncidentUpdate {
     pub updated_at: String,
 }
 
-pub async fn fetch_status() -> Result<StatusSummary, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://status.claude.com/api/v2/summary.json")
-        .send()
-        .await
-        .map_err(|e| format!("Status request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Status API returned {}", resp.status()));
-    }
-
-    resp.json::<StatusSummary>()
-        .await
-        .map_err(|e| format!("Failed to parse status response: {e}"))
+pub async fn fetch_status() -> Result<serde_json::Value, FetchError> {
+    let req = reqwest::Client::new().get("https://status.claude.com/api/v2/summary.json");
+    get_json::<StatusSummary>(req, "Status").await
 }
 
 /// Map a component/overall status string to a severity for icon coloring.

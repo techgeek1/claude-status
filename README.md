@@ -9,8 +9,9 @@ A COSMIC panel applet that shows your Claude subscription usage limits and servi
 - **Service status** — per-component health from the Claude status page (claude.ai, API, Claude Code, etc.)
 - **Active incidents** — surfaces ongoing incidents with the latest update
 - **Panel icon indicator** — status dot overlay on the icon when services are degraded
-- **Remote-control sleep inhibitor** — optionally holds a logind `sleep:idle` inhibitor while a Claude Code remote-control session is attached, so a remote session isn't cut off by idle suspend (toggleable in the popup, on by default)
-- **Auto-refresh** — status polled every 5 minutes in the background, usage + status refreshed every 60 seconds while the popup is open (debounced)
+- **Remote-control indicator** — a dot on the icon and a session list while a Claude Code remote-control client is attached
+- **Auto-refresh** — status polled every 5 minutes in the background, usage + status refreshed every 60 seconds while the popup is open
+- **Rate-limit friendly** — the per-monitor applet instances share one cache, so each endpoint is hit at most once per minute however many panels you have; failures back off exponentially (60s to 15m) and honor `Retry-After`
 
 ## Requirements
 
@@ -43,9 +44,11 @@ Usage data is fetched from the (undocumented) OAuth usage endpoint at `api.anthr
 
 Usage bars come from the response's `limits` array, which labels each window by kind and scope — so new model-scoped limits appear automatically. The older named fields (`five_hour`, `seven_day`, ...) are used as a fallback if that array is absent.
 
-Remote-control detection watches `~/.claude/sessions/` with inotify (falling back to 10s polling). Claude Code merges a `bridgeSessionId` into `<pid>.json` while a remote client is attached and writes it back as `null` on detach; a session counts as attached when that field is set and the owning pid is alive. The inhibitor is a `login1.Manager.Inhibit("sleep:idle")` lock, held via the returned fd for as long as any session is attached. The preference is stored with cosmic-config under `dev.techgeek1.CosmicExtAppletClaudeStatus/v1`.
+Remote-control detection watches `~/.claude/sessions/` with inotify (falling back to 10s polling). Claude Code merges a `bridgeSessionId` into `<pid>.json` while a remote client is attached and writes it back as `null` on detach; a session counts as attached when that field is set and the owning pid is alive.
 
 Service status is fetched from the public Atlassian Statuspage API at `status.claude.com/api/v2/summary.json`. No authentication required.
+
+cosmic-panel starts one applet process per output. They coordinate through `$XDG_RUNTIME_DIR/claude-status/`: each feed has a JSON cache file and a lock file. Whichever instance takes the (non-blocking) `flock` first fetches, if the cache is older than the TTL and no backoff is in effect, and renames the new entry into place; the others skip the request and pick up the result via inotify. Opening the popup shows the cached data immediately and only refetches once it's a minute old.
 
 ## License
 

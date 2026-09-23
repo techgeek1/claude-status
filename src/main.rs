@@ -1,8 +1,7 @@
 mod api;
 mod app;
-mod config;
-mod inhibit;
 mod rc;
+mod shared;
 
 fn main() -> cosmic::iced::Result {
     tracing_subscriber::fmt::init();
